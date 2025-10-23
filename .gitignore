@@ -1,0 +1,13 @@
+# Test files
+test_vector.cu
+test_vector
+
+# Binaries and build outputs
+*.o
+*.out
+*.exe
+app.host
+app.cuda
+*.log
+*.ptx
+build/
