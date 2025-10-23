@@ -306,8 +306,8 @@ public:
         local_size,
         my_scalar,
         other_scalar,
-        other.data_dev,
-        data_dev);
+        other.data,
+        data);
 #endif
       }
     else
@@ -392,9 +392,7 @@ public:
                              MemorySpace::CUDA,
                              communicator);
         // TODO implement copy from host to device for GPU
-        cudaMalloc(&data_dev, n * sizeof(Number));
-        cudaMemcpy(data_dev, data_host, n * sizeof(Number), cudaMemcpyHostToDevice);
-
+        AssertCuda(cudaMemcpy(other.data, data, local_size * sizeof(Number), cudaMemcpyHostToDevice));
         return other;
       }
   }
@@ -410,7 +408,7 @@ public:
                              MemorySpace::Host,
                              communicator);
         // TODO implement copy from device to host for GPU
-        cudaMemcpy(data_host, data_dev, n_elements * sizeof(Number), cudaMemcpyDeviceToHost);
+        AssertCuda(cudaMemcpy(other.data, data, local_size * sizeof(Number), cudaMemcpyDeviceToHost));
 
         return other;
       }
