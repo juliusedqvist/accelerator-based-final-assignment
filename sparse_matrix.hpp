@@ -9,6 +9,8 @@
 #endif
 
 #include <omp.h>
+#include <iostream>
+#include <algorithm>
 
 #include <vector>
 
@@ -17,12 +19,13 @@
 
 #ifndef DISABLE_CUDA
 template <typename Number>
-__global__ void compute_spmv(const std::size_t N,
-                             const std::size_t *row_starts,
-                             const unsigned int *column_indices,
-                             const Number *values,
-                             const Number *x,
-                             Number *y)
+__global__ void compute_spmv(
+                              const std::size_t N,
+                              const std::size_t *row_starts,
+                              const unsigned int *column_indices,
+                              const Number *values,
+                              const Number *x,
+                              Number *y)
 {
   // TODO implement for GPU
   const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,6 +40,41 @@ __global__ void compute_spmv(const std::size_t N,
   {
     const unsigned int col = column_indices[idx];
     sum += values[idx] * x[col];
+  }
+
+  y[row] = sum;
+}
+
+template <typename Number>
+__global__ void compute_spmv_sell(
+    const unsigned int n_rows,
+    const unsigned int n_slices,
+    const unsigned int C,
+    const std::size_t  *cs,
+    const unsigned int *cl,
+    const unsigned int *col,
+    const Number       *val,
+    const Number       *x,
+    Number             *y)
+{
+  const unsigned int slice = blockIdx.x;
+  const unsigned int lane  = threadIdx.x; // row inside slice
+
+  if (slice >= n_slices || lane >= C)
+    return;
+
+  const unsigned int row = slice * C + lane;
+  if (row >= n_rows)
+    return;  // very important for the last partial slice
+
+  Number sum = 0;
+  const unsigned int slice_len = cl[slice];
+  const std::size_t  base      = cs[slice];
+
+  // Column-major by slice: idx = base + j*C + lane
+  for (unsigned int j = 0; j < slice_len; ++j) {
+    const std::size_t idx = base + j * C + lane;
+    sum += val[idx] * x[col[idx]];
   }
 
   y[row] = sum;
@@ -70,6 +108,7 @@ public:
       row_starts[row + 1] = row_starts[row] + row_lengths[row];
 
     const std::size_t n_entries = row_starts[n_rows];
+
 
     if (memory_space == MemorySpace::CUDA)
       {
@@ -130,37 +169,71 @@ public:
   }
 
   SparseMatrix(const SparseMatrix &other)
-    : communicator(other.communicator),
-      memory_space(other.memory_space),
-      n_rows(other.n_rows),
-      n_global_nonzero_entries(other.n_global_nonzero_entries)
+      : communicator(other.communicator),
+        memory_space(other.memory_space),
+        n_rows(other.n_rows),
+        n_global_nonzero_entries(other.n_global_nonzero_entries),
+        // also copy SELL metadata
+        sell_C(other.sell_C),
+        sell_sigma(other.sell_sigma),
+        sell_n_slices(other.sell_n_slices),
+        sell_total_nnz(other.sell_total_nnz),
+        d_sell_cs(nullptr),
+        d_sell_cl(nullptr),
+        d_sell_col(nullptr),
+        d_sell_val(nullptr)
   {
     if (memory_space == MemorySpace::CUDA)
+    {
+      // === copy CSR device arrays ===
+      AssertCuda(cudaMalloc(&row_starts, (n_rows + 1) * sizeof(std::size_t)));
+      AssertCuda(cudaMemcpy(row_starts,
+                            other.row_starts,
+                            (n_rows + 1) * sizeof(std::size_t),
+                            cudaMemcpyDeviceToDevice));
+
+      std::size_t n_entries = 0;
+      AssertCuda(cudaMemcpy(&n_entries,
+                            other.row_starts + n_rows,
+                            sizeof(std::size_t),
+                            cudaMemcpyDeviceToHost));
+
+      AssertCuda(cudaMalloc(&column_indices, n_entries * sizeof(unsigned int)));
+      AssertCuda(cudaMemcpy(column_indices,
+                            other.column_indices,
+                            n_entries * sizeof(unsigned int),
+                            cudaMemcpyDeviceToDevice));
+
+      AssertCuda(cudaMalloc(&values, n_entries * sizeof(Number)));
+      AssertCuda(cudaMemcpy(values,
+                            other.values,
+                            n_entries * sizeof(Number),
+                            cudaMemcpyDeviceToDevice));
+
+      // === copy SELL arrays if present ===
+      if (other.d_sell_val != nullptr && sell_total_nnz > 0)
       {
-        AssertCuda(cudaMalloc(&row_starts, (n_rows + 1) * sizeof(std::size_t)));
-        AssertCuda(cudaMemcpy(row_starts,
-                              other.row_starts,
-                              (n_rows + 1) * sizeof(std::size_t),
+        AssertCuda(cudaMalloc(&d_sell_cs, (sell_n_slices + 1) * sizeof(std::size_t)));
+        AssertCuda(cudaMalloc(&d_sell_cl, sell_n_slices * sizeof(unsigned int)));
+        AssertCuda(cudaMalloc(&d_sell_col, sell_total_nnz * sizeof(unsigned int)));
+        AssertCuda(cudaMalloc(&d_sell_val, sell_total_nnz * sizeof(Number)));
+
+        AssertCuda(cudaMemcpy(d_sell_cs, other.d_sell_cs,
+                              (sell_n_slices + 1) * sizeof(std::size_t),
+                              cudaMemcpyDeviceToDevice));
+        AssertCuda(cudaMemcpy(d_sell_cl, other.d_sell_cl,
+                              sell_n_slices * sizeof(unsigned int),
+                              cudaMemcpyDeviceToDevice));
+        AssertCuda(cudaMemcpy(d_sell_col, other.d_sell_col,
+                              sell_total_nnz * sizeof(unsigned int),
+                              cudaMemcpyDeviceToDevice));
+        AssertCuda(cudaMemcpy(d_sell_val, other.d_sell_val,
+                              sell_total_nnz * sizeof(Number),
                               cudaMemcpyDeviceToDevice));
 
-        std::size_t n_entries = 0;
-        AssertCuda(cudaMemcpy(&n_entries,
-                              other.row_starts + n_rows,
-                              sizeof(std::size_t),
-                              cudaMemcpyDeviceToHost));
-        AssertCuda(cudaMalloc(&column_indices,
-                              n_entries * sizeof(unsigned int)));
-        AssertCuda(cudaMemcpy(column_indices,
-                              other.column_indices,
-                              n_entries * sizeof(unsigned int),
-                              cudaMemcpyDeviceToDevice));
-
-        AssertCuda(cudaMalloc(&values, n_entries * sizeof(Number)));
-        AssertCuda(cudaMemcpy(values,
-                              other.values,
-                              n_entries * sizeof(Number),
-                              cudaMemcpyDeviceToDevice));
+        std::cout << "[copy ctor] Copied SELL arrays to new CUDA matrix\n";
       }
+    }
     else
       {
 
@@ -298,17 +371,34 @@ public:
       {
 #ifndef DISABLE_CUDA
         // TODO implement for GPU (with CRS and ELLPACK/SELL-C-sigma)
+        if (d_sell_val != nullptr) {
+          // TODO launch sell-c-sigma kernel
 
-        const unsigned int n_blocks = (n_rows + block_size - 1) / block_size;
+          dim3 grid(sell_n_slices);
+          dim3 block(sell_C);
+          compute_spmv_sell<Number><<<grid, block>>>(
+              /* n_rows  */ n_rows,
+              /* n_slices*/ sell_n_slices,
+              /* C       */ sell_C,
+              /* cs      */ d_sell_cs,
+              /* cl      */ d_sell_cl,
+              /* col     */ d_sell_col,
+              /* val     */ d_sell_val,
+              /* x       */ src.begin(),
+              /* y       */ dst.begin());
+          AssertCuda(cudaPeekAtLastError());
+        } else {
+          const unsigned int n_blocks = (n_rows + block_size - 1) / block_size;
 
-        compute_spmv<<<n_blocks, block_size>>>(n_rows,
-                                                row_starts,
-                                                column_indices,
-                                                values,
-                                                src.begin(),
-                                                dst.begin());
+          compute_spmv<<<n_blocks, block_size>>>(n_rows,
+                                                 row_starts,
+                                                 column_indices,
+                                                 values,
+                                                 src.begin(),
+                                                 dst.begin());
 
-        AssertCuda(cudaPeekAtLastError());
+          AssertCuda(cudaPeekAtLastError());
+        }
 #endif
       }
     else
@@ -365,9 +455,42 @@ public:
                               values,
                               row_starts[n_rows] * sizeof(Number),
                               cudaMemcpyHostToDevice));
+        if (d_sell_val != nullptr || !h_sell_val.empty())
+        {
+          other.sell_C = sell_C;
+          other.sell_sigma = sell_sigma;
+          other.sell_n_slices = sell_n_slices;
+          other.sell_total_nnz = sell_total_nnz;
+
+          // Allocate device buffers
+          AssertCuda(cudaMalloc(&other.d_sell_cs, (sell_n_slices + 1) * sizeof(std::size_t)));
+          AssertCuda(cudaMalloc(&other.d_sell_cl, sell_n_slices * sizeof(unsigned int)));
+          AssertCuda(cudaMalloc(&other.d_sell_col, sell_total_nnz * sizeof(unsigned int)));
+          AssertCuda(cudaMalloc(&other.d_sell_val, sell_total_nnz * sizeof(Number)));
+
+          // Copy from host vectors
+          AssertCuda(cudaMemcpy(other.d_sell_cs, h_sell_cs.data(),
+                                (sell_n_slices + 1) * sizeof(std::size_t),
+                                cudaMemcpyHostToDevice));
+          AssertCuda(cudaMemcpy(other.d_sell_cl, h_sell_cl.data(),
+                                sell_n_slices * sizeof(unsigned int),
+                                cudaMemcpyHostToDevice));
+          AssertCuda(cudaMemcpy(other.d_sell_col, h_sell_col.data(),
+                                sell_total_nnz * sizeof(unsigned int),
+                                cudaMemcpyHostToDevice));
+          AssertCuda(cudaMemcpy(other.d_sell_val, h_sell_val.data(),
+                                sell_total_nnz * sizeof(Number),
+                                cudaMemcpyHostToDevice));
+
+          std::cout << "[copy_to_device] Transferred SELL arrays: "
+                    << "C=" << sell_C
+                    << " slices=" << sell_n_slices
+                    << " nnz=" << sell_total_nnz << std::endl;
+        }
         return other;
       }
   }
+  void convert_to_sell_c_sigma(const unsigned int C, const unsigned int sigma);
 
   std::size_t memory_consumption() const
   {
@@ -384,6 +507,25 @@ private:
   Number *      values;
   std::size_t   n_global_nonzero_entries;
   MemorySpace   memory_space;
+  // sell-c-sigma
+  unsigned int sell_C         = 0;
+  unsigned int sell_sigma     = 0;
+  unsigned int sell_n_slices  = 0;
+  std::size_t  sell_total_nnz = 0;   // padded total elements across slices
+
+  // ---------------- SELL-C-sigma device arrays ----------------
+  // slice starts (size: sell_n_slices + 1), cumulative offsets into val/col
+  std::size_t  *d_sell_cs   = nullptr;     // "cs" = cumulative slice offsets
+  // slice lengths (size: sell_n_slices), max row length in each slice
+  unsigned int *d_sell_cl   = nullptr;     // "cl" = columns per slice
+  // column indices and values in column-major per slice, size: sell_total_nnz
+  unsigned int *d_sell_col  = nullptr;
+  Number       *d_sell_val  = nullptr;
+
+  std::vector<std::size_t>  h_sell_cs;   // size: sell_n_slices + 1 (cumulative slice offsets)
+  std::vector<unsigned int> h_sell_cl;   // size: sell_n_slices     (max row length per slice)
+  std::vector<unsigned int> h_sell_col;  // size: sell_total_nnz    (column indices, padded, column-major per slice)
+  std::vector<Number> h_sell_val;
 
   struct GhostEntryCoordinateFormat
   {
@@ -399,5 +541,113 @@ private:
   mutable std::vector<Number>                        receive_data;
 };
 
+template <typename Number>
+void SparseMatrix<Number>::convert_to_sell_c_sigma(const unsigned int C,
+                                                   const unsigned int sigma)
+{
+  this->sell_C     = C;
+  this->sell_sigma = sigma;
+  std::cout << "Converting CSR to SELL-C-Sigma\n";
+
+  sell_n_slices = (n_rows + C - 1) / C;
+
+  // Host arrays
+  h_sell_cs.resize(sell_n_slices + 1);
+  h_sell_cl.resize(sell_n_slices);
+
+  // determine max row length per slice
+  for (unsigned int s = 0; s < sell_n_slices; ++s) {
+    unsigned int slice_start = s * C;
+    unsigned int slice_end = std::min(slice_start + C, (unsigned int)n_rows); // Extra condition if last chunk isnt C rows
+    unsigned int max_len = 0;
+
+    for (unsigned int r = slice_start; r < slice_end; ++r)
+      max_len = std::max(max_len, (unsigned int)(row_starts[r + 1] - row_starts[r])); // Increments max_len if row is larger
+
+    h_sell_cl[s] = max_len; // cl already complete
+  }
+
+  // construct cs (chunk start indices) from cl
+  h_sell_cs[0] = 0;
+  for (unsigned int s = 0; s < sell_n_slices; ++s)
+    h_sell_cs[s + 1] = h_sell_cs[s] + C * h_sell_cl[s];
+
+  // Total number of elements (including padding) stored in sell arrays
+  sell_total_nnz = h_sell_cs.back();
+
+  h_sell_col.resize(sell_total_nnz);
+  h_sell_val.resize(sell_total_nnz);
+
+  // main func
+  for (unsigned int s = 0; s < sell_n_slices; ++s)
+  {
+    unsigned int slice_start = s * C;
+    unsigned int slice_end = std::min(slice_start + C, (unsigned int)n_rows);
+    unsigned int slice_len = h_sell_cl[s];
+
+    for (unsigned int j = 0; j < slice_len; ++j)
+    {
+      for (unsigned int c = 0; c < C; ++c)
+      {
+        unsigned int row = slice_start + c;
+        if (row >= n_rows)
+          continue;
+
+        std::size_t row_begin = row_starts[row];
+        std::size_t row_end = row_starts[row + 1];
+        std::size_t row_len = row_end - row_begin;
+
+        std::size_t dest_index = h_sell_cs[s] + j * C + c; // chunk start index + column index * chunk + row within slice (to get column major)
+
+        if (j < row_len)
+        {
+          h_sell_val[dest_index] = values[row_begin + j];
+          h_sell_col[dest_index] = column_indices[row_begin + j];
+        }
+        else
+        {
+          // padding
+          h_sell_val[dest_index] = 0;
+          h_sell_col[dest_index] = column_indices[row_begin]; // safe index (0@0)
+        }
+      }
+    }
+  }
+
+#ifndef DISABLE_CUDA
+  // Free old arrays if any
+  if (d_sell_cs)
+    cudaFree(d_sell_cs);
+  if (d_sell_cl)
+    cudaFree(d_sell_cl);
+  if (d_sell_col)
+    cudaFree(d_sell_col);
+  if (d_sell_val)
+    cudaFree(d_sell_val);
+
+  // Allocate device arrays
+  AssertCuda(cudaMalloc(&d_sell_cs, (sell_n_slices + 1) * sizeof(std::size_t)));
+  AssertCuda(cudaMalloc(&d_sell_cl, sell_n_slices * sizeof(unsigned int)));
+  AssertCuda(cudaMalloc(&d_sell_col, sell_total_nnz * sizeof(unsigned int)));
+  AssertCuda(cudaMalloc(&d_sell_val, sell_total_nnz * sizeof(Number)));
+
+  // Copy host → device
+  AssertCuda(cudaMemcpy(d_sell_cs, h_sell_cs.data(),
+                        (sell_n_slices + 1) * sizeof(std::size_t),
+                        cudaMemcpyHostToDevice));
+
+  AssertCuda(cudaMemcpy(d_sell_cl, h_sell_cl.data(),
+                        sell_n_slices * sizeof(unsigned int),
+                        cudaMemcpyHostToDevice));
+
+  AssertCuda(cudaMemcpy(d_sell_col, h_sell_col.data(),
+                        sell_total_nnz * sizeof(unsigned int),
+                        cudaMemcpyHostToDevice));
+
+  AssertCuda(cudaMemcpy(d_sell_val, h_sell_val.data(),
+                        sell_total_nnz * sizeof(Number),
+                        cudaMemcpyHostToDevice));
+#endif
+}
 
 #endif

@@ -71,6 +71,7 @@ SparseMatrix<Number> fill_sparse_matrix(const unsigned int size,
             sparse.add_row(row, col_indices, values);
           }
   }
+  sparse.convert_to_sell_c_sigma(32,1);
   return sparse;
 }
 
