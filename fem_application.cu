@@ -95,7 +95,16 @@ void run_test(const long long N, const long long n_repeat)
   const MemorySpace host_space = MemorySpace::Host;
 
   SparseMatrix<Number> matrix = fill_sparse_matrix<Number>(N, host_space);
+  auto t_copy_start = std::chrono::steady_clock::now();
   SparseMatrix<Number> matrix_dev = matrix.copy_to_device();
+  cudaDeviceSynchronize();
+  auto t_copy_end = std::chrono::steady_clock::now();
+
+  double t_copy = std::chrono::duration_cast<std::chrono::duration<double>>(
+                      t_copy_end - t_copy_start)
+                      .count();
+
+  std::cout << "Host→Device matrix transfer time: " << t_copy << " s" << std::endl;
 
   Vector<Number>    src(N * N * N, host_space);
   Vector<Number>    dst(src), result(src);
