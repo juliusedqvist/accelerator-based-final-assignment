@@ -25,6 +25,21 @@ __global__ void compute_spmv(const std::size_t N,
                              Number *y)
 {
   // TODO implement for GPU
+  const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= N)
+    return;
+
+  Number sum = 0;
+  const std::size_t start = row_starts[row];
+  const std::size_t end = row_starts[row + 1];
+
+  for (std::size_t idx = start; idx < end; ++idx)
+  {
+    const unsigned int col = column_indices[idx];
+    sum += values[idx] * x[col];
+  }
+
+  y[row] = sum;
 }
 #endif
 
@@ -283,6 +298,16 @@ public:
       {
 #ifndef DISABLE_CUDA
         // TODO implement for GPU (with CRS and ELLPACK/SELL-C-sigma)
+
+        const unsigned int n_blocks = (n_rows + block_size - 1) / block_size;
+
+        compute_spmv<<<n_blocks, block_size>>>(n_rows,
+                                                row_starts,
+                                                column_indices,
+                                                values,
+                                                src.begin(),
+                                                dst.begin());
+
         AssertCuda(cudaPeekAtLastError());
 #endif
       }
